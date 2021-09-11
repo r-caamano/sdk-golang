@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	sctp "github.com/ishidawataru/sctp"
@@ -98,6 +100,7 @@ func serveClient(conn net.Conn, bufsize int) error {
 		}
 		fmt.Printf("stream: %v, ppid: %v, payload: %v\n", streamid, ppid, payload)
 		log.Printf("read: %v", n)
+		log.Printf("zbuf: %v", zbuf[:zn])
 		n, err = conn.Write(zbuf[:zn])
 		if err != nil {
 			log.Printf("write failed: %v", err)
@@ -183,25 +186,38 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 			Stream: uint16(streamid),
 			PPID:   uint32(ppid),
 		}
-		ppid += 1
+		//ppid += 1
 		conn.SubscribeEvents(sctp.SCTP_EVENT_DATA_IO)
 		buf := make([]byte, *bufsize)
 		if err != nil {
 			log.Printf("cant make random: %v", err)
 		}
-		zn, err = conn.SCTPWrite(msg, info)
+		zn, err = conn.SCTPWrite(msg[6:], info)
 		if err != nil {
 			log.Fatalf("failed to write: %v", err)
 		}
 		log.Printf("write: len %d", zn)
 		now = time.Now()
 		conn.SetReadDeadline(now.Add(time.Second * 1))
+		//n, info, err := conn.SCTPRead(buf)
 		n, info, err := conn.SCTPRead(buf)
 		if err != nil {
 			log.Fatalf("failed to read: %v", err)
 		}
+		message := new(bytes.Buffer)
+		binary.Write(message, binary.BigEndian, info.Stream)
+		binary.Write(message, binary.BigEndian, info.SSN)
+		binary.Write(message, binary.BigEndian, uint32(0))
+		binary.Write(message, binary.BigEndian, info.PPID)
+		binary.Write(message, binary.BigEndian, uint64(0))
+		binary.Write(message, binary.BigEndian, info.TSN)
+		binary.Write(message, binary.BigEndian, uint32(0))
+		binary.Write(message, binary.BigEndian, uint32(0))
+		binary.Write(message, binary.LittleEndian, buf[:n])
+		packet := message.Bytes()
+		fmt.Printf("packet", packet)
 		log.Printf("read: len %d, info: %+v", n, info)
-		if _, err := zconn.Write(buf[:n]); err != nil {
+		if _, err := zconn.Write(packet); err != nil {
 			logrus.WithError(err).Error("failed to write. closing connection")
 			_ = conn.Close()
 		}
