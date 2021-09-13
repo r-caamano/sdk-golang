@@ -36,7 +36,8 @@ func serveClient(conn net.Conn, bufsize int) error {
 		configFile, err := config.NewFromFile(file)
 		if err != nil {
 			logrus.WithError(err).Error("Error loading config file")
-			os.Exit(1)
+			conn.Close()
+			return err
 		}
 		context = ziti.NewContextWithConfig(configFile)
 	} else {
@@ -50,7 +51,8 @@ func serveClient(conn net.Conn, bufsize int) error {
 	zconn, err := context.DialWithOptions(service, dialOptions)
 	if err != nil {
 		logrus.WithError(err).Error("Error dialing service")
-		os.Exit(1)
+		_ = conn.Close()
+		return err
 	}
 	for {
 		buf := make([]byte, bufsize+128) //  overhead of SCTPSndRvInfoWrappedConn
@@ -59,6 +61,8 @@ func serveClient(conn net.Conn, bufsize int) error {
 		n, err := conn.Read(buf)
 		if err != nil {
 			log.Printf("read failed: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
 			return err
 		}
 		message := buf[:n]
@@ -69,6 +73,8 @@ func serveClient(conn net.Conn, bufsize int) error {
 		streamid, err := strconv.ParseUint(streamidS, 16, 64)
 		if err != nil {
 			log.Printf("read: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
 			return err
 		}
 		ppid0 := strconv.FormatInt(int64(message[11]), 16)
@@ -79,6 +85,8 @@ func serveClient(conn net.Conn, bufsize int) error {
 		ppid, err := strconv.ParseUint(ppidS, 16, 64)
 		if err != nil {
 			log.Printf("read: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
 			return err
 		}
 
@@ -95,6 +103,7 @@ func serveClient(conn net.Conn, bufsize int) error {
 		zconn.SetReadDeadline(now.Add(time.Second * 1))
 		zn, err := zconn.Read(zbuf)
 		if err != nil {
+			_ = zconn.Close()
 			_ = conn.Close()
 			return err
 		}
@@ -104,6 +113,8 @@ func serveClient(conn net.Conn, bufsize int) error {
 		n, err = conn.Write(zbuf[:zn])
 		if err != nil {
 			log.Printf("write failed: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
 			return err
 		}
 		log.Printf("write: %d", n)
@@ -124,7 +135,9 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 
 	conn, err := sctp.DialSCTP("sctp", laddr, addr)
 	if err != nil {
-		log.Fatalf("failed to dial: %v", err)
+		log.Printf("failed to dial: %v", err)
+		_ = zconn.Close()
+		return err
 	}
 
 	log.Printf("Dail LocalAddr: %s; RemoteAddr: %s", conn.LocalAddr(), conn.RemoteAddr())
@@ -132,23 +145,34 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 	if *sndbuf != 0 {
 		err = conn.SetWriteBuffer(*sndbuf)
 		if err != nil {
-			log.Fatalf("failed to set write buf: %v", err)
+			log.Printf("failed to set write buf: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
 		}
 	}
 	if *rcvbuf != 0 {
 		err = conn.SetReadBuffer(*rcvbuf)
 		if err != nil {
-			log.Fatalf("failed to set read buf: %v", err)
+			log.Printf("failed to set read buf: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
+			return err
 		}
 	}
 
 	*sndbuf, err = conn.GetWriteBuffer()
 	if err != nil {
-		log.Fatalf("failed to get write buf: %v", err)
+		log.Printf("failed to get write buf: %v", err)
+		_ = zconn.Close()
+		_ = conn.Close()
+		return err
 	}
 	*rcvbuf, err = conn.GetReadBuffer()
 	if err != nil {
-		log.Fatalf("failed to get read buf: %v", err)
+		log.Printf("failed to get read buf: %v", err)
+		_ = zconn.Close()
+		_ = conn.Close()
+		return err
 	}
 	log.Printf("SndBufSize: %d, RcvBufSize: %d", *sndbuf, *rcvbuf)
 
@@ -158,6 +182,7 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 		zconn.SetReadDeadline(now.Add(time.Second * 1))
 		zn, err := zconn.Read(zbuf)
 		if err != nil {
+			_ = zconn.Close()
 			_ = conn.Close()
 			return err
 		}
@@ -169,6 +194,8 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 		streamid, err := strconv.ParseUint(streamidS, 16, 64)
 		if err != nil {
 			log.Printf("read: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
 			return err
 		}
 		ppid0 := strconv.FormatInt(int64(msg[5]), 16)
@@ -179,6 +206,8 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 		ppid, err := strconv.ParseUint(ppidS, 16, 64)
 		if err != nil {
 			log.Printf("read: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
 			return err
 		}
 
@@ -191,10 +220,16 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 		buf := make([]byte, *bufsize)
 		if err != nil {
 			log.Printf("cant make random: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
+			return err
 		}
 		zn, err = conn.SCTPWrite(msg[6:], info)
 		if err != nil {
-			log.Fatalf("failed to write: %v", err)
+			log.Printf("failed to write: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
+			return err
 		}
 		log.Printf("write: len %d", zn)
 		now = time.Now()
@@ -202,7 +237,10 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 		//n, info, err := conn.SCTPRead(buf)
 		n, info, err := conn.SCTPRead(buf)
 		if err != nil {
-			log.Fatalf("failed to read: %v", err)
+			log.Printf("failed to read: %v", err)
+			_ = zconn.Close()
+			_ = conn.Close()
+			return err
 		}
 		message := new(bytes.Buffer)
 		binary.Write(message, binary.BigEndian, info.Stream)
@@ -220,6 +258,8 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 		if _, err := zconn.Write(packet); err != nil {
 			logrus.WithError(err).Error("failed to write. closing connection")
 			_ = conn.Close()
+			_ = zconn.Close()
+			return err
 		}
 		time.Sleep(time.Second)
 	}
@@ -301,43 +341,54 @@ func main() {
 	} else {
 		logger := pfxlog.Logger()
 		options := ziti.ListenOptions{
-			ConnectTimeout:        10 * time.Second,
-			MaxConnections:        3,
-			BindUsingEdgeIdentity: true,
+			ConnectTimeout: 10 * time.Second,
+			MaxConnections: 3,
+			//BindUsingEdgeIdentity: true,
 		}
 		logger.Infof("binding service %v\n", service)
+		var err error
 		var listener edge.Listener
+		var identity *edge.CurrentIdentity
+		var configFile *config.Config
 		if len(*configPtr) > 0 {
 			file := *configPtr
-			configFile, err := config.NewFromFile(file)
+			configFile, err = config.NewFromFile(file)
 			if err != nil {
 				logrus.WithError(err).Error("Error loading config file")
 				os.Exit(1)
 			}
 			context := ziti.NewContextWithConfig(configFile)
-			identity, err := context.GetCurrentIdentity()
-			if err != nil {
-				logrus.WithError(err).Error("Error resolving local Identity")
-				os.Exit(1)
+			for identity == nil {
+				identity, err = context.GetCurrentIdentity()
+				if err != nil {
+					logrus.WithError(err).Error("Error resolving local Identity")
+				}
 			}
 			fmt.Printf("\n%+v now serving\n\n", identity.Name)
-			listener, err = context.ListenWithOptions(service, &options)
-			if err != nil {
-				logrus.WithError(err).Error("Error Binding Service")
-				os.Exit(1)
+			for listener == nil {
+				listener, err = context.ListenWithOptions(service, &options)
+				if err != nil {
+					logrus.WithError(err).Error("Error Binding Service")
+
+				}
 			}
 		} else {
 			context := ziti.NewContext()
-			identity, err := context.GetCurrentIdentity()
-			if err != nil {
-				logrus.WithError(err).Error("Error resolving local Identity")
-				os.Exit(1)
+			var identity *edge.CurrentIdentity
+			for identity == nil {
+				identity, err = context.GetCurrentIdentity()
+				if err != nil {
+					logrus.WithError(err).Error("Error resolving local Identity")
+					time.Sleep(time.Duration(5) * time.Second)
+				}
 			}
 			fmt.Printf("\n%+v now serving\n\n", identity.Name)
-			listener, err = context.ListenWithOptions(service, &options)
-			if err != nil {
-				logrus.WithError(err).Error("Error Binding Service")
-				os.Exit(1)
+			for listener == nil {
+				listener, err = context.ListenWithOptions(service, &options)
+				if err != nil {
+					logrus.WithError(err).Error("Error Binding Service")
+					time.Sleep(time.Duration(5) * time.Second)
+				}
 			}
 		}
 		for {
