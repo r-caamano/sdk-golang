@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"flag"
 	"fmt"
-	sctp "github.com/ishidawataru/sctp"
+	"github.com/ishidawataru/sctp"
 	"github.com/michaelquigley/pfxlog"
 	"github.com/openziti/sdk-golang/ziti"
 	"github.com/openziti/sdk-golang/ziti/config"
@@ -60,64 +60,61 @@ func serveClient(conn net.Conn, bufsize int) error {
 		conn.SetReadDeadline(now.Add(time.Second * 1))
 		n, err := conn.Read(buf)
 		if err != nil {
-			log.Printf("read failed: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-		message := buf[:n]
-		fmt.Println(message)
-		streamid0 := strconv.FormatInt(int64(message[1]), 16)
-		streamid1 := strconv.FormatInt(int64(message[0]), 16)
-		streamidS := streamid0 + streamid1
-		streamid, err := strconv.ParseUint(streamidS, 16, 64)
-		if err != nil {
-			log.Printf("read: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-		ppid0 := strconv.FormatInt(int64(message[11]), 16)
-		ppid1 := strconv.FormatInt(int64(message[10]), 16)
-		ppid2 := strconv.FormatInt(int64(message[9]), 16)
-		ppid3 := strconv.FormatInt(int64(message[8]), 16)
-		ppidS := ppid0 + ppid1 + ppid2 + ppid3
-		ppid, err := strconv.ParseUint(ppidS, 16, 64)
-		if err != nil {
-			log.Printf("read: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
+			log.Printf("read from sctp timed-out: %v", err)
+		}else {
+			message := buf[:n]
+			fmt.Println(message)
+			/*streamid0 := strconv.FormatInt(int64(message[1]), 16)
+			streamid1 := strconv.FormatInt(int64(message[0]), 16)
+			streamidS := streamid0 + streamid1
+			streamid, err := strconv.ParseUint(streamidS, 16, 64)
+			if err != nil {
+				log.Printf("read: %v", err)
+				_ = zconn.Close()
+				_ = conn.Close()
+				return err
+			}
+			ppid0 := strconv.FormatInt(int64(message[11]), 16)
+			ppid1 := strconv.FormatInt(int64(message[10]), 16)
+			ppid2 := strconv.FormatInt(int64(message[9]), 16)
+			ppid3 := strconv.FormatInt(int64(message[8]), 16)
+			ppidS := ppid0 + ppid1 + ppid2 + ppid3
+			ppid, err := strconv.ParseUint(ppidS, 16, 64)
+			if err != nil {
+				log.Printf("read: %v", err)
+				_ = zconn.Close()
+				return err
+			}*/
 
-		bytesPpid := message[8:12]
-		bytesStream := message[0:2]
-		header := append(bytesStream, bytesPpid...)
-		payload := message[33:n]
-		packet := append(header, payload...)
-		if _, err := zconn.Write(packet); err != nil {
-			panic(err)
+			bytesPpid := message[8:12]
+			bytesStream := message[0:2]
+			header := append(bytesStream, bytesPpid...)
+			payload := message[33:n]
+			packet := append(header, payload...)
+			if _, err := zconn.Write(packet); err != nil {
+				return err
+			}
+
 		}
 		zbuf := make([]byte, 1500)
 		now = time.Now()
 		zconn.SetReadDeadline(now.Add(time.Second * 1))
 		zn, err := zconn.Read(zbuf)
 		if err != nil {
-			_ = zconn.Close()
-			_ = conn.Close()
+			log.Printf("read from ziti timed-out: %v", err)
 			return err
+		}else{
+			log.Printf("read: %v", zn)
+			log.Printf("zbuf: %v", zbuf[:zn])
+			n, err = conn.Write(zbuf[:zn])
+			if err != nil {
+				log.Printf("write failed: %v", err)
+				_ = zconn.Close()
+				_ = conn.Close()
+				return err
+			}
+			log.Printf("write: %d", n)
 		}
-		fmt.Printf("stream: %v, ppid: %v, payload: %v\n", streamid, ppid, payload)
-		log.Printf("read: %v", n)
-		log.Printf("zbuf: %v", zbuf[:zn])
-		n, err = conn.Write(zbuf[:zn])
-		if err != nil {
-			log.Printf("write failed: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-		log.Printf("write: %d", n)
 	}
 }
 
@@ -182,84 +179,79 @@ func handleSctp(zconn net.Conn, ips []net.IPAddr) error {
 		zconn.SetReadDeadline(now.Add(time.Second * 1))
 		zn, err := zconn.Read(zbuf)
 		if err != nil {
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-		msg := zbuf[:zn]
+			log.Printf("read from ziti timed-out: %v", err)
+		}else {
+			msg := zbuf[:zn]
+			streamid0 := strconv.FormatInt(int64(msg[1]), 16)
+			streamid1 := strconv.FormatInt(int64(msg[0]), 16)
+			streamidS := streamid0 + streamid1
+			streamid, err := strconv.ParseUint(streamidS, 16, 64)
+			if err != nil {
+				log.Printf("read: %v", err)
+				_ = zconn.Close()
+				_ = conn.Close()
+				return err
+			}
+			ppid0 := strconv.FormatInt(int64(msg[5]), 16)
+			ppid1 := strconv.FormatInt(int64(msg[4]), 16)
+			ppid2 := strconv.FormatInt(int64(msg[3]), 16)
+			ppid3 := strconv.FormatInt(int64(msg[2]), 16)
+			ppidS := ppid0 + ppid1 + ppid2 + ppid3
+			ppid, err := strconv.ParseUint(ppidS, 16, 64)
+			if err != nil {
+				log.Printf("read: %v", err)
+				_ = zconn.Close()
+				_ = conn.Close()
+				return err
+			}
 
-		streamid0 := strconv.FormatInt(int64(msg[1]), 16)
-		streamid1 := strconv.FormatInt(int64(msg[0]), 16)
-		streamidS := streamid0 + streamid1
-		streamid, err := strconv.ParseUint(streamidS, 16, 64)
-		if err != nil {
-			log.Printf("read: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
+			info := &sctp.SndRcvInfo{
+				Stream: uint16(streamid),
+				PPID:   uint32(ppid),
+			}
+			//ppid += 1
+			conn.SubscribeEvents(sctp.SCTP_EVENT_DATA_IO)
+			if err != nil {
+				log.Printf("cant make random: %v", err)
+				_ = zconn.Close()
+				_ = conn.Close()
+				return err
+			}
+			zn, err = conn.SCTPWrite(msg[6:], info)
+			if err != nil {
+				log.Printf("failed to write: %v", err)
+				_ = zconn.Close()
+				_ = conn.Close()
+				return err
+			}
+			log.Printf("write: len %d", zn)
 		}
-		ppid0 := strconv.FormatInt(int64(msg[5]), 16)
-		ppid1 := strconv.FormatInt(int64(msg[4]), 16)
-		ppid2 := strconv.FormatInt(int64(msg[3]), 16)
-		ppid3 := strconv.FormatInt(int64(msg[2]), 16)
-		ppidS := ppid0 + ppid1 + ppid2 + ppid3
-		ppid, err := strconv.ParseUint(ppidS, 16, 64)
-		if err != nil {
-			log.Printf("read: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-
-		info := &sctp.SndRcvInfo{
-			Stream: uint16(streamid),
-			PPID:   uint32(ppid),
-		}
-		//ppid += 1
-		conn.SubscribeEvents(sctp.SCTP_EVENT_DATA_IO)
-		buf := make([]byte, *bufsize)
-		if err != nil {
-			log.Printf("cant make random: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-		zn, err = conn.SCTPWrite(msg[6:], info)
-		if err != nil {
-			log.Printf("failed to write: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-		log.Printf("write: len %d", zn)
 		now = time.Now()
 		conn.SetReadDeadline(now.Add(time.Second * 1))
-		//n, info, err := conn.SCTPRead(buf)
+		buf := make([]byte, *bufsize)
 		n, info, err := conn.SCTPRead(buf)
 		if err != nil {
-			log.Printf("failed to read: %v", err)
-			_ = zconn.Close()
-			_ = conn.Close()
-			return err
-		}
-		message := new(bytes.Buffer)
-		binary.Write(message, binary.BigEndian, info.Stream)
-		binary.Write(message, binary.BigEndian, info.SSN)
-		binary.Write(message, binary.BigEndian, uint32(0))
-		binary.Write(message, binary.BigEndian, info.PPID)
-		binary.Write(message, binary.BigEndian, uint64(0))
-		binary.Write(message, binary.BigEndian, info.TSN)
-		binary.Write(message, binary.BigEndian, uint32(0))
-		binary.Write(message, binary.BigEndian, uint32(0))
-		binary.Write(message, binary.LittleEndian, buf[:n])
-		packet := message.Bytes()
-		fmt.Printf("packet", packet)
-		log.Printf("read: len %d, info: %+v", n, info)
-		if _, err := zconn.Write(packet); err != nil {
-			logrus.WithError(err).Error("failed to write. closing connection")
-			_ = conn.Close()
-			_ = zconn.Close()
-			return err
+			log.Printf("read from ziti timed-out: %v", err)
+		}else {
+			message := new(bytes.Buffer)
+			binary.Write(message, binary.BigEndian, info.Stream)
+			binary.Write(message, binary.BigEndian, info.SSN)
+			binary.Write(message, binary.BigEndian, uint32(0))
+			binary.Write(message, binary.BigEndian, info.PPID)
+			binary.Write(message, binary.BigEndian, uint64(0))
+			binary.Write(message, binary.BigEndian, info.TSN)
+			binary.Write(message, binary.BigEndian, uint32(0))
+			binary.Write(message, binary.BigEndian, uint32(0))
+			binary.Write(message, binary.LittleEndian, buf[:n])
+			packet := message.Bytes()
+			fmt.Printf("packet", packet)
+			log.Printf("read: len %d, info: %+v", n, info)
+			if _, err := zconn.Write(packet); err != nil {
+				logrus.WithError(err).Error("failed to write. closing connection")
+				_ = conn.Close()
+				_ = zconn.Close()
+				return err
+			}
 		}
 		time.Sleep(time.Second)
 	}
