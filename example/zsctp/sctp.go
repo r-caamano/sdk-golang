@@ -265,7 +265,7 @@ func main() {
 	bufsize = flag.Int("bufsize", 256, "")
 	sndbuf = flag.Int("sndbuf", 0, "")
 	rcvbuf = flag.Int("rcvbuf", 0, "")
-	servicePtr = flag.String("s", "ziti-sctp", "Name of Service")
+	servicePtr = flag.String("s", "sctp-trans", "Name of Service")
 	configPtr = flag.String("c", "", "Name of config file")
 	flag.Parse()
 
@@ -279,6 +279,8 @@ func main() {
 			log.Printf("Error resolving address '%s': %v", i, err)
 		}
 	}
+	service = *servicePtr
+
 	addr := &sctp.SCTPAddr{
 		IPAddrs: ips,
 		Port:    *port,
