@@ -17,7 +17,9 @@
 package impl
 
 import (
+	"bytes"
 	"fmt"
+	"github.com/openziti/foundation/util/info"
 	"github.com/sirupsen/logrus"
 	"io"
 	"net"
@@ -27,7 +29,7 @@ import (
 	"github.com/michaelquigley/pfxlog"
 	"github.com/netfoundry/secretstream"
 	"github.com/netfoundry/secretstream/kx"
-	"github.com/openziti/foundation/channel2"
+	"github.com/openziti/channel"
 	"github.com/openziti/foundation/util/concurrenz"
 	"github.com/openziti/foundation/util/sequencer"
 	"github.com/openziti/sdk-golang/ziti/edge"
@@ -48,7 +50,7 @@ var _ edge.Conn = &edgeConn{}
 type edgeConn struct {
 	edge.MsgChannel
 	readQ                 sequencer.Sequencer
-	leftover              []byte
+	readBuffer            bytes.Buffer
 	msgMux                edge.MsgMux
 	hosting               sync.Map
 	closed                concurrenz.AtomicBoolean
@@ -99,12 +101,37 @@ func (conn *edgeConn) CloseWrite() error {
 	return nil
 }
 
-func (conn *edgeConn) Accept(msg *channel2.Message) {
+func (conn *edgeConn) Accept(msg *channel.Message) {
 	conn.TraceMsg("Accept", msg)
 	switch conn.connType {
 	case ConnTypeDial:
 		if msg.ContentType == edge.ContentTypeStateClosed {
 			conn.sentFIN.Set(true) // if we're not closing until all reads are done, at least prevent more writes
+		}
+
+		if msg.ContentType == edge.ContentTypeTraceRoute {
+			hops, _ := msg.GetUint32Header(edge.TraceHopCountHeader)
+			if hops > 0 {
+				hops--
+				msg.PutUint32Header(edge.TraceHopCountHeader, hops)
+			}
+
+			ts, _ := msg.GetUint64Header(edge.TimestampHeader)
+			connId, _ := msg.GetUint32Header(edge.ConnIdHeader)
+			resp := edge.NewTraceRouteResponseMsg(connId, hops, ts, "sdk/golang", "")
+
+			sourceRequestId, _ := msg.GetUint32Header(edge.TraceSourceRequestIdHeader)
+			resp.PutUint32Header(edge.TraceSourceRequestIdHeader, sourceRequestId)
+
+			if msgUUID := msg.Headers[edge.UUIDHeader]; msgUUID != nil {
+				resp.Headers[edge.UUIDHeader] = msgUUID
+			}
+
+			if err := conn.Send(resp); err != nil {
+				logrus.WithFields(edge.GetLoggerFields(msg)).WithError(err).
+					Error("failed to send trace route response")
+			}
+			return
 		}
 
 		if err := conn.readQ.PutSequenced(0, msg); err != nil {
@@ -169,7 +196,7 @@ func (conn *edgeConn) HandleMuxClose() error {
 	return nil
 }
 
-func (conn *edgeConn) HandleClose(channel2.Channel) {
+func (conn *edgeConn) HandleClose(channel.Channel) {
 	logger := pfxlog.Logger().WithField("connId", conn.Id())
 	defer logger.Debug("received HandleClose from underlying channel, marking conn closed")
 	conn.readQ.Close()
@@ -179,7 +206,7 @@ func (conn *edgeConn) HandleClose(channel2.Channel) {
 }
 
 func (conn *edgeConn) Connect(session *edge.Session, options *edge.DialOptions) (edge.Conn, error) {
-	logger := pfxlog.Logger().WithField("connId", conn.Id())
+	logger := pfxlog.Logger().WithField("connId", conn.Id()).WithField("sessionId", session.Id)
 
 	var pub []byte
 	if conn.crypto {
@@ -187,7 +214,7 @@ func (conn *edgeConn) Connect(session *edge.Session, options *edge.DialOptions) 
 	}
 	connectRequest := edge.NewConnectMsg(conn.Id(), session.Token, pub, options)
 	conn.TraceMsg("connect", connectRequest)
-	replyMsg, err := conn.SendAndWaitWithTimeout(connectRequest, options.ConnectTimeout)
+	replyMsg, err := connectRequest.WithTimeout(options.ConnectTimeout).SendForReply(conn.Channel)
 	if err != nil {
 		logger.Error(err)
 		return nil, err
@@ -209,7 +236,6 @@ func (conn *edgeConn) Connect(session *edge.Session, options *edge.DialOptions) 
 		method, _ := replyMsg.GetByteHeader(edge.CryptoMethodHeader)
 		hostPubKey := replyMsg.Headers[edge.PublicKeyHeader]
 		if hostPubKey != nil {
-			logger = logger.WithField("session", session.Id)
 			logger.Debug("setting up end-to-end encryption")
 			if err = conn.establishClientCrypto(conn.keyPair, hostPubKey, edge.CryptoMethod(method)); err != nil {
 				logger.WithError(err).Error("crypto failure")
@@ -277,8 +303,8 @@ func (conn *edgeConn) establishServerCrypto(keypair *kx.KeyPair, peerKey []byte,
 func (conn *edgeConn) Listen(session *edge.Session, service *edge.Service, options *edge.ListenOptions) (edge.Listener, error) {
 	logger := pfxlog.Logger().
 		WithField("connId", conn.Id()).
-		WithField("service", service.Name).
-		WithField("session", session.Token)
+		WithField("serviceName", service.Name).
+		WithField("sessionId", session.Id)
 
 	listener := &edgeListener{
 		baseListener: baseListener{
@@ -308,7 +334,7 @@ func (conn *edgeConn) Listen(session *edge.Session, service *edge.Service, optio
 	}
 	bindRequest := edge.NewBindMsg(conn.Id(), session.Token, pub, options)
 	conn.TraceMsg("listen", bindRequest)
-	replyMsg, err := conn.SendAndWaitWithTimeout(bindRequest, 5*time.Second)
+	replyMsg, err := bindRequest.WithTimeout(5 * time.Second).SendForReply(conn.Channel)
 	if err != nil {
 		logger.WithError(err).Error("failed to bind")
 		return nil, err
@@ -337,12 +363,15 @@ func (conn *edgeConn) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 
-	log.Tracef("read buffer = %d bytes", cap(p))
-	if len(conn.leftover) > 0 {
-		log.Tracef("found %d leftover bytes", len(conn.leftover))
-		n := copy(p, conn.leftover)
-		conn.leftover = conn.leftover[n:]
-		return n, nil
+	log.Tracef("read buffer = %d bytes", len(p))
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	read, _ := conn.readBuffer.Read(p)
+	if read > 0 {
+		log.Debugf("read %d readBuffer bytes, %d bytes readBuffer", read, conn.readBuffer.Len())
+		return read, nil
 	}
 
 	for {
@@ -360,7 +389,7 @@ func (conn *edgeConn) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
-		msg := next.(*channel2.Message)
+		msg := next.(*channel.Message)
 
 		flags, _ := msg.GetUint32Header(edge.FlagsHeader)
 		if flags&edge.FIN != 0 {
@@ -394,18 +423,15 @@ func (conn *edgeConn) Read(p []byte) (int, error) {
 			if conn.receiver != nil {
 				d, _, err = conn.receiver.Pull(d)
 				if err != nil {
-					log.WithFields(edge.GetLoggerFields(msg)).Errorf("crypto failed on msg of size=%v, headers=%+v err=(%v)", len(msg.Body), msg.Headers, err)
+					log.WithFields(edge.GetLoggerFields(msg)).Errorf("crypto failed on msg of size=%v, headers=%+v err=(%v)",
+						len(msg.Body), msg.Headers, err)
 					return 0, err
 				}
 			}
-			if len(d) <= cap(p) {
-				log.Debugf("reading %v bytes", len(d))
-				return copy(p, d), nil
-			}
-			conn.leftover = d[cap(p):]
-			log.Tracef("saving %d bytes for leftover", len(conn.leftover))
-			log.Debugf("reading %v bytes", len(p))
-			return copy(p, d), nil
+			conn.readBuffer.Write(d)
+			read, _ = conn.readBuffer.Read(p)
+			log.Debugf("reading %d bytes, %d bytes readBuffer", read, conn.readBuffer.Len())
+			return read, nil
 
 		default:
 			log.WithField("type", msg.ContentType).Error("unexpected message")
@@ -444,7 +470,7 @@ func (conn *edgeConn) close(closedByRemote bool) {
 	conn.hosting.Range(func(key, value interface{}) bool {
 		listener := value.(*edgeListener)
 		if err := listener.Close(); err != nil {
-			log.WithError(err).Errorf("failed to close listener for service %v", listener.service.Name)
+			log.WithError(err).WithField("serviceName", listener.service.Name).Error("failed to close listener")
 		}
 		return true
 	})
@@ -458,7 +484,7 @@ func (conn *edgeConn) getListener(token string) (*edgeListener, bool) {
 	return nil, false
 }
 
-func (conn *edgeConn) newChildConnection(message *channel2.Message) {
+func (conn *edgeConn) newChildConnection(message *channel.Message) {
 	token := string(message.Body)
 	logger := pfxlog.Logger().WithField("connId", conn.Id()).WithField("token", token)
 	logger.Debug("looking up listener")
@@ -467,7 +493,7 @@ func (conn *edgeConn) newChildConnection(message *channel2.Message) {
 		logger.Warn("listener not found")
 		reply := edge.NewDialFailedMsg(conn.Id(), "invalid token")
 		reply.ReplyTo(message)
-		if err := conn.SendPrioritizedWithTimeout(reply, channel2.Highest, time.Second*5); err != nil {
+		if err := reply.WithPriority(channel.Highest).WithTimeout(5 * time.Second).SendAndWaitForWire(conn.Channel); err != nil {
 			logger.WithError(err).Error("failed to send reply to dial request")
 		}
 		return
@@ -505,7 +531,7 @@ func (conn *edgeConn) newChildConnection(message *channel2.Message) {
 		newConnLogger.WithError(err).Error("invalid conn id, already in use")
 		reply := edge.NewDialFailedMsg(conn.Id(), err.Error())
 		reply.ReplyTo(message)
-		if err := conn.SendPrioritizedWithTimeout(reply, channel2.Highest, time.Second*5); err != nil {
+		if err := reply.WithPriority(channel.Highest).WithTimeout(5 * time.Second).SendAndWaitForWire(conn.Channel); err != nil {
 			logger.WithError(err).Error("failed to send reply to dial request")
 		}
 		return
@@ -530,7 +556,7 @@ func (conn *edgeConn) newChildConnection(message *channel2.Message) {
 		newConnLogger.WithError(err).Error("Failed to establish connection")
 		reply := edge.NewDialFailedMsg(conn.Id(), err.Error())
 		reply.ReplyTo(message)
-		if err := conn.SendPrioritizedWithTimeout(reply, channel2.Highest, time.Second*5); err != nil {
+		if err := reply.WithPriority(channel.Highest).WithTimeout(5 * time.Second).SendAndWaitForWire(conn.Channel); err != nil {
 			logger.WithError(err).Error("Failed to send reply to dial request")
 		}
 		return
@@ -573,10 +599,37 @@ func (conn *edgeConn) CompleteAcceptFailed(err error) {
 	}
 }
 
+func (conn *edgeConn) TraceRoute(hops uint32, timeout time.Duration) (*edge.TraceRouteResult, error) {
+	msg := edge.NewTraceRouteMsg(conn.Id(), hops, uint64(info.NowInMilliseconds()))
+	resp, err := msg.WithTimeout(timeout).SendForReply(conn.Channel)
+	if err != nil {
+		return nil, err
+	}
+	if resp.ContentType != edge.ContentTypeTraceRouteResponse {
+		return nil, errors.Errorf("unexpected response: %v", resp.ContentType)
+	}
+	hops, _ = resp.GetUint32Header(edge.TraceHopCountHeader)
+	ts, _ := resp.GetUint64Header(edge.TimestampHeader)
+	elapsed := time.Duration(0)
+	if ts > 0 {
+		elapsed = time.Duration(info.NowInMilliseconds()-int64(ts)) * time.Millisecond
+	}
+	hopType, _ := resp.GetStringHeader(edge.TraceHopTypeHeader)
+	hopId, _ := resp.GetStringHeader(edge.TraceHopIdHeader)
+
+	result := &edge.TraceRouteResult{
+		Hops:    hops,
+		Time:    elapsed,
+		HopType: hopType,
+		HopId:   hopId,
+	}
+	return result, nil
+}
+
 type newConnHandler struct {
 	conn                 *edgeConn
 	edgeCh               *edgeConn
-	message              *channel2.Message
+	message              *channel.Message
 	txHeader             []byte
 	routerProvidedConnId bool
 }
@@ -593,7 +646,7 @@ func (self *newConnHandler) dialFailed(err error) {
 	newConnLogger.WithError(err).Error("Failed to establish connection")
 	reply := edge.NewDialFailedMsg(self.conn.Id(), err.Error())
 	reply.ReplyTo(self.message)
-	if err := self.conn.SendPrioritizedWithTimeout(reply, channel2.Highest, time.Second*5); err != nil {
+	if err := reply.WithPriority(channel.Highest).WithTimeout(5 * time.Second).SendAndWaitForWire(self.conn.Channel); err != nil {
 		logger.WithError(err).Error("Failed to send reply to dial request")
 	}
 }
@@ -613,7 +666,7 @@ func (self *newConnHandler) dialSucceeded() error {
 	reply.ReplyTo(self.message)
 
 	if !self.routerProvidedConnId {
-		startMsg, err := self.conn.SendPrioritizedAndWaitWithTimeout(reply, channel2.Highest, time.Second*5)
+		startMsg, err := reply.WithPriority(channel.Highest).WithTimeout(5 * time.Second).SendForReply(self.conn.Channel)
 		if err != nil {
 			logger.WithError(err).Error("Failed to send reply to dial request")
 			return err
@@ -623,7 +676,7 @@ func (self *newConnHandler) dialSucceeded() error {
 			logger.Errorf("failed to receive start after dial. got %v", startMsg)
 			return errors.Errorf("failed to receive start after dial. got %v", startMsg)
 		}
-	} else if err := self.conn.SendPrioritizedWithTimeout(reply, channel2.Highest, time.Second*5); err != nil {
+	} else if err := reply.WithPriority(channel.Highest).WithTimeout(time.Second * 5).SendAndWaitForWire(self.conn.Channel); err != nil {
 		logger.WithError(err).Error("Failed to send reply to dial request")
 		return err
 	}
